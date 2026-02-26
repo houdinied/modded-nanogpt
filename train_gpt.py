@@ -1059,7 +1059,16 @@ class AttnArgs:
     ve_gate_w: torch.Tensor
     train_max_seq_len: torch.Tensor
 
-flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
+from flash_attn.cute.interface import _flash_attn_fwd, _flash_attn_bwd
+from flash_attn.cute import flash_attn_varlen_func as _fa_varlen_raw
+
+@torch.compiler.disable
+def _fa_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal, softmax_scale, window_size):
+    out = _fa_varlen_raw(q, k, v, cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
+                          max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k,
+                          causal=causal, softmax_scale=softmax_scale, window_size=window_size)
+    return out[0] if isinstance(out, tuple) else out
+
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int, paired: bool = False):
@@ -1124,7 +1133,7 @@ class CausalSelfAttention(nn.Module):
             max_len = 2 * max_len
 
         # use flash_attn over flex_attn @varunneal. flash_attn_varlen suggested by @YouJiacheng
-        y = flash_attn_interface.flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
+        y = _fa_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
                                                         max_seqlen_q=max_len, max_seqlen_k=max_len,
                                                         causal=True, softmax_scale=yarn.attn_scale, window_size=(bm_size, 0))
         y = y.view(B, T, self.num_heads, self.head_dim)
@@ -1591,7 +1600,7 @@ class Hyperparameters:
     val_files: str = os.path.join(data_path, "data/fineweb10B/fineweb_val_*.bin") # input .bin to eval validation loss on
     val_tokens: int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # batch sizes
-    val_batch_size: int = 4 * 64 * 1024 * 8
+    val_batch_size: int = 1 * 64 * 1024 * 8
     # schedule
     num_scheduled_iterations: int = 1450  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
@@ -1929,7 +1938,10 @@ model.mlp_bank.data = model.mlp_bank.data.bfloat16()
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
-model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
+model: nn.Module = torch.compile(model, dynamic=False) 
+# fullgraph=True disabled for B200: FA4 CuTe uses TVM/DLPack internally which accesses raw tensor data pointers. 
+# torch.compile traces with FakeTensors (shape-only, no data) so it crashes. 
+#Wrapping FA4 as a custom_op with register_fake fixes tracing but Inductor miscompiles the lse output tensor at runtime.
 training_manager = TrainingManager(model)
 
 
