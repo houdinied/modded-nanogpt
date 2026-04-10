@@ -757,23 +757,57 @@ def transpose_add(src: torch.Tensor, dst: torch.Tensor):
     )
 
 
+HAS_FP4 = hasattr(torch, 'float4_e2m1fn_x2')
+
+def _quantize_to_fp4_block(x, group_size=16):
+    """Quantize a 2D tensor to FP4 E2M1 with per-block scaling (group size 16)."""
+    assert x.ndim == 2 and x.shape[1] % group_size == 0
+    M, K = x.shape
+    x_blocked = x.reshape(M, K // group_size, group_size)
+    amax = x_blocked.abs().amax(dim=-1)
+    scales = (amax / 6.0).clamp(min=1e-12)
+    x_scaled = x_blocked / scales.unsqueeze(-1)
+    x_fp4 = x_scaled.reshape(M, K).to(torch.float4_e2m1fn_x2)
+    scales_f8 = scales.to(torch.float8_e4m3fn)
+    return x_fp4, scales_f8
+
 class FusedSoftcappedCrossEntropy(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, targets, mtp_weights, lm_head_weight, x_s, w_s, grad_s, A=23.0, B=5.0, C=7.5):
 
+        if HAS_FP4:
+            # FP4 block-scaled forward for logits computation
+            x_fp4, x_scales = _quantize_to_fp4_block(x)
+            w_t = lm_head_weight.T.contiguous()  # (out, in)
+            w_fp4, w_scales = _quantize_to_fp4_block(w_t)
+            w_fp4_col_major = w_fp4.T.contiguous().T
+
+            logits = torch._scaled_mm(
+                x_fp4,
+                w_fp4_col_major,
+                out_dtype=torch.bfloat16,
+                scale_a=x_scales,
+                scale_b=w_scales,
+                use_fast_accum=True,
+            )
+        else:
+            # FP8 fallback
+            x_f8_fwd = x.div(x_s).to(torch.float8_e4m3fn)
+            w_f8_fwd = lm_head_weight.div(w_s).to(torch.float8_e4m3fn)
+            w_f8_col_major = w_f8_fwd.T.contiguous().T
+
+            logits = torch._scaled_mm(
+                x_f8_fwd,
+                w_f8_col_major,
+                out_dtype=torch.bfloat16,
+                scale_a=x.new_tensor(x_s, dtype=torch.float32),
+                scale_b=x.new_tensor(w_s, dtype=torch.float32),
+                use_fast_accum=True,
+            )
+
+        # Always save FP8 for backward (FP4 too lossy for gradient computation)
         x_f8 = x.div(x_s).to(torch.float8_e4m3fn)
         w_f8 = lm_head_weight.div(w_s).to(torch.float8_e4m3fn)
-
-        w_f8_col_major = w_f8.T.contiguous().T
-
-        logits = torch._scaled_mm(
-            x_f8,
-            w_f8_col_major,
-            out_dtype=torch.bfloat16,
-            scale_a=x.new_tensor(x_s, dtype=torch.float32),
-            scale_b=x.new_tensor(w_s, dtype=torch.float32),
-            use_fast_accum=True,
-        )
 
         n_rows, n_cols = logits.shape
         if mtp_weights is None:

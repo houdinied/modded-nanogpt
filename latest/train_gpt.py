@@ -155,6 +155,98 @@ def setup_context_t(ctx: torch.autograd.function.FunctionCtx, inputs, output):
 mm_t_op.register_autograd(backward_t, setup_context=setup_context_t)
 
 # -----------------------------------------------------------------------------
+# Custom operators: NVFP4 matmul for Blackwell GPUs
+# FP4 E2M1 forward with block scaling (group size 16), FP8 backward
+
+HAS_FP4 = hasattr(torch, 'float4_e2m1fn_x2')
+
+def quantize_to_fp4_block(x: Tensor, group_size: int = 16) -> tuple[Tensor, Tensor]:
+    """Quantize a 2D BF16/FP32 tensor to FP4 E2M1 with per-block scaling.
+
+    Args:
+        x: Input tensor of shape (M, K) where K is divisible by group_size
+        group_size: Number of elements per scaling block (default 16, per NVFP4 spec)
+
+    Returns:
+        x_fp4: Quantized tensor in torch.float4_e2m1fn_x2 (packed, 2 values per byte)
+        scales: Per-block scale factors in float8_e4m3fn, shape (M, K // group_size)
+    """
+    assert x.ndim == 2 and x.shape[1] % group_size == 0
+    M, K = x.shape
+    # Reshape into blocks of group_size along the reduction dimension
+    x_blocked = x.reshape(M, K // group_size, group_size)
+    # Compute per-block absolute max
+    amax = x_blocked.abs().amax(dim=-1)  # (M, K // group_size)
+    # FP4 E2M1 max representable value is 6.0 (= 1.5 * 2^2)
+    scales = (amax / 6.0).clamp(min=1e-12)
+    # Scale and quantize
+    x_scaled = x_blocked / scales.unsqueeze(-1)
+    x_fp4 = x_scaled.reshape(M, K).to(torch.float4_e2m1fn_x2)
+    scales_f8 = scales.to(torch.float8_e4m3fn)
+    return x_fp4, scales_f8
+
+if HAS_FP4:
+    @torch.library.custom_op("nanogpt::mm_t_fp4", mutates_args=())
+    def mm_t_fp4_op(x: Tensor, w: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor, Tensor]:
+        """Computes y = x @ w with FP4 block-scaled forward, saving FP8 tensors for backward."""
+        @torch.compile
+        def impl(x: Tensor, w: Tensor):
+            assert x.is_contiguous() and w.is_contiguous()
+            assert x.shape[1] == w.shape[0]  # x: (batch, in), w: (in, out)
+
+            # FP4 block-scaled forward
+            x_fp4, x_scales = quantize_to_fp4_block(x)
+            # w is (in, out), need to quantize along in-dimension for w^T matmul
+            # torch._scaled_mm computes A @ B, so we need x_fp4 @ w_fp4
+            # w stored as (in, out), so we quantize w.T = (out, in) along K=in dim
+            w_t = w.T.contiguous()  # (out, in)
+            w_fp4, w_scales = quantize_to_fp4_block(w_t)
+
+            # _scaled_mm: A @ B^T where B is provided in column-major
+            w_fp4_col_major = w_fp4.T.contiguous().T
+            out = torch._scaled_mm(
+                x_fp4,
+                w_fp4_col_major,
+                out_dtype=torch.bfloat16,
+                scale_a=x_scales,
+                scale_b=w_scales,
+                use_fast_accum=True,
+            )
+
+            # Save FP8 versions for backward (FP4 too lossy for gradient computation)
+            x_f8 = x.div(x_s).to(torch.float8_e4m3fn)
+            w_f8 = w.div(w_s).to(torch.float8_e4m3fn)
+            return out, x_f8, w_f8
+
+        return impl(x, w)
+
+    @mm_t_fp4_op.register_fake
+    def _(x: Tensor, w: Tensor, *_):
+        assert x.ndim == w.ndim == 2
+        assert x.shape[1] == w.shape[0]
+        assert x.device == w.device
+        assert x.is_contiguous() and w.is_contiguous()
+        return x @ w, x.to(torch.float8_e4m3fn), w.to(torch.float8_e4m3fn)
+
+    def backward_t_fp4(ctx, grad_out: Tensor, *_):
+        x_f8, w_f8 = ctx.saved_tensors
+        x_s, w_s, grad_s = ctx.scales
+        # Backward uses FP8 (same as original)
+        grad_x, grad_w = torch.ops.nanogpt.mm_t_backward(
+            grad_out, x_f8, w_f8, x_s, w_s, grad_s
+        )
+        return grad_x, grad_w, None, None, None
+
+    def setup_context_t_fp4(ctx: torch.autograd.function.FunctionCtx, inputs, output):
+        *_, x_s, w_s, grad_s = inputs
+        _, x_f8, w_f8 = output
+        ctx.save_for_backward(x_f8, w_f8)
+        ctx.scales = x_s, w_s, grad_s
+        ctx.set_materialize_grads(False)
+
+    mm_t_fp4_op.register_autograd(backward_t_fp4, setup_context=setup_context_t_fp4)
+
+# -----------------------------------------------------------------------------
 # Polar Express
 
 # Computed for num_iters=5, safety_factor=2e-2, cushion=2
@@ -951,10 +1043,11 @@ class CastedLinearT(nn.Module):
     Linear layer with transposed weight storage (in_features, out_features) which
     addresses the slow kernel that was used for gradient accumulation. @chrisjmccormick
     """
-    def __init__(self, in_features: int, out_features: int, use_fp8=False, x_s=1.0, w_s=1.0, grad_s=1.0):
+    def __init__(self, in_features: int, out_features: int, use_fp8=False, use_fp4=False, x_s=1.0, w_s=1.0, grad_s=1.0):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
+        self.use_fp4 = use_fp4
         self.use_fp8 = use_fp8
         self.x_s = x_s
         self.w_s = w_s
@@ -968,7 +1061,11 @@ class CastedLinearT(nn.Module):
             nn.init.zeros_(self.weight) # @Grad62304977 and others
 
     def forward(self, x: Tensor):
-        if self.use_fp8 and self.training:
+        if self.use_fp4 and self.training:
+            _x = x.flatten(0, -2)
+            out = torch.ops.nanogpt.mm_t_fp4(_x, self.weight, x_s=self.x_s, w_s=self.w_s, grad_s=self.grad_s)[0]
+            return out.reshape(*x.shape[:-1], -1)
+        elif self.use_fp8 and self.training:
             _x = x.flatten(0, -2)
             out = torch.ops.nanogpt.mm_t(_x, self.weight, x_s=self.x_s, w_s=self.w_s, grad_s=self.grad_s)[0]
             return out.reshape(*x.shape[:-1], -1)
@@ -1217,9 +1314,10 @@ class GPT(nn.Module):
         self.yarn_paired_head = Yarn(head_dim, max_seq_len, paired=True)
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
-        use_fp8 = not os.environ.get("DISABLE_FP8", False)
+        use_fp4 = HAS_FP4 and not os.environ.get("DISABLE_FP4", False)
+        use_fp8 = not use_fp4 and not os.environ.get("DISABLE_FP8", False)
         # Transposed weight storage for faster gradient accumulation
-        self.lm_head = CastedLinearT(model_dim, self.vocab_size, use_fp8=use_fp8, x_s=100/448, w_s=1.6/448, grad_s=grad_scale * 0.75/448)
+        self.lm_head = CastedLinearT(model_dim, self.vocab_size, use_fp8=use_fp8, use_fp4=use_fp4, x_s=100/448, w_s=1.6/448, grad_s=grad_scale * 0.75/448)
 
         nn.init.normal_(self.lm_head.weight, mean=0, std=0.005)
 

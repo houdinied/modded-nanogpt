@@ -3,3 +3,23 @@ pylog124M/
 __pycache__/
 logs/
 .DS_Store
+
+# Large data / model files
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.npy
+*.npz
+*.safetensors
+*.h5
+*.hdf5
+*.parquet
+
+# Virtual environments
+venv/
+
+# Data directories
+data/fineweb10B/
+data/fineweb100B/
+data/finewebedu10B/
