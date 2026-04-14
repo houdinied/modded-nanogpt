@@ -1,7 +1,11 @@
 New stuff
+# to build and run
 sudo docker build -t optimized .
 docker run -it --rm --gpus all -v $(pwd):/optimized optimized python data/fineweb.py
 docker run -it --rm --gpus all -v $(pwd):/optimized optimized bash run.sh
+
+# to run interactive shell
+sudo docker run -it --rm --gpus all -v $(pwd):/optimized optimized bash
 
 
 OLD 

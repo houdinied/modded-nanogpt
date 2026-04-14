@@ -20,6 +20,22 @@ logs/
 venv/
 
 # Data directories
-data/fineweb10B/
-data/fineweb100B/
-data/finewebedu10B/
+data/
+
+# Environment files
+.env
+*.env
+
+# Weights & Biases
+wandb/
+
+# Legacy directories
+muon_addition_back/
+optimized/
+base/
+latest/
+
+# Build artifacts
+kernels/build/
+*.so
+*.egg-info/

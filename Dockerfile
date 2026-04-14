@@ -10,8 +10,8 @@ RUN curl -O https://www.python.org/ftp/python/${PYTHON_VERSION}/Python-${PYTHON_
 
 RUN ln -s /usr/local/bin/python3.12 /usr/local/bin/python &&     ln -s /usr/local/bin/pip3.12 /usr/local/bin/pip
 
-COPY requirements.txt /optimized/requirements.txt
-WORKDIR /optimized
+COPY requirements.txt /app/requirements.txt
+WORKDIR /app
 
 RUN python -m pip install --upgrade pip &&     pip install -r requirements.txt
 
@@ -30,7 +30,8 @@ RUN pip install --pre torch --index-url https://download.pytorch.org/whl/nightly
 RUN pip install scipy
 
 # Build and install Quartet-II NVFP4 kernels for B200 (sm100)
-COPY Quartet-II/kernels /tmp/quartet2-kernels
+# https://arxiv.org/abs/2601.22813
+COPY kernels /tmp/quartet2-kernels
 RUN cd /tmp/quartet2-kernels && CUDAARCHS=100 pip install --no-build-isolation --no-deps . &&     rm -rf /tmp/quartet2-kernels
 
 CMD ["bash"]

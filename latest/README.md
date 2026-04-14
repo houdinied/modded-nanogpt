@@ -6,7 +6,7 @@ The target (3.28 validation loss on FineWeb) follows Andrej Karpathy's [GPT-2 re
 The speedrun code also descends from llm.c's [PyTorch trainer](https://github.com/karpathy/llm.c/blob/master/train_gpt2.py), which itself descends from NanoGPT, hence the name of the repo.
 Thanks to the efforts of many contributors, this repo now contains a training algorithm which attains the target performance in:
 * Under 90 seconds on 8xH100 (the llm.c GPT-2 replication needed 45 minutes)
-* under 500M tokens (the llm.c GPT-2 replication needed 10B)
+* under 400M tokens (the llm.c GPT-2 replication needed 10B)
 
 This improvement in training speed has been brought about by the following techniques:
 * Modernized architecture: Rotary embeddings, QK-Norm, and ReLU²
@@ -18,7 +18,7 @@ This improvement in training speed has been brought about by the following techn
 * Flash Attention 3 with long-short sliding window attention pattern (inspired by Gemma 2) and window size warmup with YaRN
 * Align training batch starts with EoS and set a max document length
 * Accumulate gradients for 2 steps for embedding and lm_head before updating parameters
-* Enable model to back out contributions from first 2/3 layers before prediction
+* Backout, with single activation input for last 3 attention layers
 * Polar Express implementation in Muon
 * Smear module to enable 1 token look back
 * Sparse attention gate
@@ -33,7 +33,6 @@ This improvement in training speed has been brought about by the following techn
 * Additional gating on value embeddings and skip connection
 * Paired head attention
 * Bigram hash embedding
-* Partitioned Hyperconnections
 
 As well as many systems optimizations.
 
@@ -51,7 +50,8 @@ Contributors list (growing with each new record): [@bozavlado](https://x.com/boz
 [@ChrisJMcCormick](https://x.com/ChrisJMcCormick), [@dominikkallusky](https://github.com/dominikkallusky), [@acutkosky](https://github.com/acutkosky), 
 [@manikbhandari](https://github.com/manikbhandari), [@andrewbriand](https://x.com/andrewbriand8), [@jrauvola](https://x.com/Joshrav21),
 [@soren_dunn_](https://x.com/soren_dunn_), [@photon_mz](https://x.com/photon_mz), [@srashedll](https://x.com/srashedll), [@dhrvji](https://x.com/dhrvji),
-[@EmmettBicker](https://github.com/EmmettBicker), [@dualverse-ai](https://github.com/dualverse-ai), [@sisovicm](https://x.com/sisovicm)
+[@EmmettBicker](https://github.com/EmmettBicker), [@dualverse-ai](https://github.com/dualverse-ai), [@sisovicm](https://x.com/sisovicm),
+[@moof2x](https://github.com/moof2x), [@samacqua](https://github.com/samacqua)
 
 
 ---
@@ -176,8 +176,12 @@ Note: The 3.28 target was selected to match [Andrej Karpathy's GPT-2 (small) rep
 70 | 1.521 minutes | [Tune value embed layout and ve_gates](https://x.com/classiclarryd/status/2023319358303510719) | 02/03/26 | [log](records/track_1_short/2026-02-03_VeTuned/42cbebac-0599-4a89-a00e-26d1c4cad140.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/218) | @photon_mz
 71 | 1.516 minutes | [Sparse bigram gradient comms and optimized loading on CPU](https://x.com/classiclarryd/status/2023319358303510719) | 02/06/26 | [log](records/track_1_short/2026-02-06_SparseBigramGradient/02fee7bd-cd22-478b-9e8e-12e857ff3152.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/221) | @roeeshenberg
 72 | 1.496 minutes | [Increase minimum lr and add max_seq_len schedule](https://x.com/classiclarryd/status/2023319358303510719) | 02/10/26 | [log](records/track_1_short/2026-02-10_ShortWindow/Short-Window_1_1.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/224) | @dualverse-ai & AI System [Station](https://github.com/dualverse-ai/station)
-73 | 1.485 minutes | Partitioned Hyperconnections | 02/12/26 | [log](records/track_1_short/2026-02-12_ParallelResiduals/451050db-d471-49db-b19b-be824bb896d0.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/230) | @sisovicm
-
+73 | 1.485 minutes | [Partitioned Hyperconnections](https://x.com/classiclarryd/status/2026131531207761924) | 02/12/26 | [log](records/track_1_short/2026-02-12_ParallelResiduals/451050db-d471-49db-b19b-be824bb896d0.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/230) | @sisovicm
+74 | 1.468 minutes | [Flattened GPT forward, removed post attention lambdas, added transpose kernels](https://x.com/classiclarryd/status/2027228782483182059) | 02/16/26 | [log](records/track_1_short/2026-02-16_FlattenForward/pr233/2026-02-16_21-30-05_time-362_secs_F-inject-post-attn_9f12a3.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/233) | @ChrisJMcCormick
+75 | 1.453 minutes | [Cross Entropy Kernel Optimizations](https://x.com/classiclarryd/status/2030087884854939947) | 02/23/26 | [log](records/track_1_short/2026-02-23_CrossEntropyKernel/1e51be6b-7dd4-41ab-b95d-e57da5814776.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/235) | @moof2x
+76 | 1.446 minutes | [Reuse and tune backward transpose kernel](https://x.com/classiclarryd/status/2030403421027852337) | 02/28/26 | [log](records/track_1_short/2026-02-28_TransposeCopyBackward/this_pr/14c9cefc-c840-493f-870e-61bb1d2b1d97.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/240) | @samacqua
+77 | 1.435 minutes | [Replace partitioned hyperconnections with single saved activation](https://x.com/classiclarryd/status/2030465730718908884) | 03/06/26 | [log](records/track_1_short/2026-03-06_SimplifyHC/0ab4a843-8c3a-4fb4-9fff-8e1d39852646.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/241) | @classiclarryd
+78 | 1.426 minutes | [Tighten bounds on fa3 max_num_docs to match fineweb distribution](https://x.com/classiclarryd/status/2038077427180851240) | 03/22/26 | [log](records/track_1_short/2026-03-22_VarlenMaxDocs/combined/2026-03-22_20-07-32_time-186_secs_06-mbeta2-max-docs_227ce8.txt),[PR](https://github.com/KellerJordan/modded-nanogpt/pull/246) | @ChrisJMcCormick
 ## Rules
 
 New records must:
@@ -393,4 +397,3 @@ compared to Shampoo.
 ```
 
 <img src="img/dofa.jpg" alt="itsover_wereback" style="width:100%;">
-
